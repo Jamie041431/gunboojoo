@@ -1,0 +1,760 @@
+/**
+ * Firebase Cloud Functions 後端邏輯
+ *
+ * 協議： https.onCall (✅ 已降回 V1 SDK 語法)
+ * 儲存： 通知儲存在 'users' 文件內的 'notifications' 陣列中
+ *
+ * ✅ 功能：已補全所有通知函數
+ * ✅ 修正：已移除 'functions.region(REGION)' 來修復部署錯誤
+ * ✅ 新功能：已新增「聊天通知」和「留言通知」觸發器
+ */
+
+const functions = require("firebase-functions");
+const admin = require("firebase-admin");
+
+if (!admin.apps.length) {
+  admin.initializeApp();
+}
+const db = admin.firestore();
+const fieldValue = admin.firestore.FieldValue;
+
+// const REGION = "us-central1"; // 已移除，全部使用預設值
+
+/**
+ * 產生自訂 appId，格式 GUNBOOJO-XXXX
+ * @return {string} appId
+ */
+const generateAppId = () => {
+  const chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let randomPart = "";
+  for (let i = 0; i < 4; i++) {
+    randomPart += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return `GUNBOOJO-${randomPart}`;
+};
+
+// ======================================================
+// 1. 帳號與好友關係管理 (Callable Functions)
+// ======================================================
+
+/**
+ * 建立使用者 Profile (使用 https.onCall)
+ */
+exports.createUser = functions // ✅ 移除 .region(REGION)
+    .https.onCall(async (data, context) => {
+      if (!context.auth) {
+        throw new functions.https.HttpsError(
+            "unauthenticated", "User must be authenticated.");
+      }
+      const {uid, displayName, email} = data;
+      if (!uid || !displayName || !email) {
+        throw new functions.https.HttpsError(
+            "invalid-argument", "Missing user info.");
+      }
+      if (context.auth.uid !== uid) {
+        throw new functions.https.HttpsError(
+            "permission-denied", "Cannot create a profile for another user.");
+      }
+
+      // 檢查暱稱 (需要索引)
+      const existingName = await db
+          .collection("users")
+          .where("displayName", "==", displayName)
+          .get();
+      if (!existingName.empty) {
+        throw new functions.https.HttpsError(
+            "already-exists", "Display name already taken");
+      }
+
+      const appId = generateAppId();
+      const displayNameLower = displayName.toLowerCase().trim();
+      const timestamp = fieldValue.serverTimestamp();
+
+      const newUserProfile = {
+        id: uid,
+        appId: appId, // 新用戶會建立 appId
+        uid: uid,
+        friendCode: appId, // 新用戶也會建立 friendCode (確保相容性)
+        displayName,
+        displayName_lower: displayNameLower,
+        email,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        avatarUrl: `https-://picsum.photos/200/200?random=${uid}`,
+        friends: [],
+        friendRequests: [],
+        incomingRequests: [],
+        outgoingRequests: [],
+        notifications: [],
+        level: 1,
+        xp: 0,
+        xpToNextLevel: 100,
+        points: 0,
+        missionsCompleted: 0,
+        checkIns: 0,
+        latlng: {lat: 25.04, lng: 121.53},
+      };
+
+      await db.collection("users").doc(uid).set(newUserProfile);
+      return newUserProfile;
+    });
+
+/**
+ * 搜尋使用者 (✅ 僅搜尋 appId)
+ */
+exports.searchUsers = functions // ✅ 移除 .region(REGION)
+    .https.onCall(async (data, context) => {
+      if (!context.auth) {
+        throw new functions.https.HttpsError(
+            "unauthenticated", "Must be authenticated.");
+      }
+
+      const {query} = data;
+      if (!query) {
+        throw new functions.https.HttpsError(
+            "invalid-argument", "Missing query");
+      }
+
+      const results = [];
+      const queryUpper = query.toUpperCase().trim();
+
+      try {
+        // ✅ 關鍵修改：只搜尋 appId
+        const appIdQuery = db
+            .collection("users")
+            .where("appId", "==", queryUpper)
+            .limit(1);
+        const appIdSnap = await appIdQuery.get();
+
+        appIdSnap.forEach((doc) => {
+          const userData = doc.data();
+          results.push({
+            id: doc.id,
+            appId: userData.appId,
+            displayName: userData.displayName,
+            avatarUrl: userData.avatarUrl || "",
+          });
+        });
+      } catch (err) {
+        functions.logger.warn(
+            "searchUsers: 'appId' query failed. Check Index.",
+            err.message);
+      }
+
+      return results;
+    });
+
+
+/**
+ * 發送好友邀請
+ */
+exports.sendFriendRequest = functions // ✅ 移除 .region(REGION)
+    .https.onCall(async (data, context) => {
+      if (!context.auth) {
+        throw new functions.https.HttpsError(
+            "unauthenticated", "Must be authenticated.");
+      }
+      const myUid = context.auth.uid;
+      const {friendId} = data;
+      if (!friendId || myUid === friendId) {
+        throw new functions.https.HttpsError(
+            "invalid-argument", "Invalid input.");
+      }
+      const userSnap = await db.collection("users").doc(myUid).get();
+      if (!userSnap.exists) {
+        throw new functions.https.HttpsError(
+            "not-found", "Your user profile not found.");
+      }
+      // ✅ 修正：提供備用值 "Unknown"，防止 userAppId 為 undefined
+      const userAppId =
+        userSnap.data().appId || userSnap.data().friendCode || "UnknownUser";
+
+      const friendRef = db.collection("users").doc(friendId);
+      const friendSnap = await friendRef.get();
+      if (!friendSnap.exists) {
+        throw new functions.https.HttpsError("not-found", "Friend not found");
+      }
+      const friendData = friendSnap.data();
+
+      // ✅ 修正：安全地檢查 friends 陣列
+      if (friendData &&
+          friendData.friends &&
+          friendData.friends.includes(myUid)) {
+        throw new functions.https.HttpsError(
+            "already-exists", "You are already friends.");
+      }
+
+      // ✅ 修正：安全地過濾 friendRequests 和 notifications 陣列
+      const friendRequests = (friendData.friendRequests || []).filter(String);
+      const notifications = (friendData.notifications || []).filter(Boolean);
+
+      if (!friendRequests.includes(myUid)) {
+        notifications.push({
+          id: generateAppId(),
+          type: "friend_request",
+          from: userAppId,
+          fromUid: myUid,
+          timestamp: fieldValue.serverTimestamp(),
+          read: false,
+        });
+        await friendRef.update({
+          friendRequests: fieldValue.arrayUnion(myUid),
+          notifications: notifications, // 寫入已過濾的乾淨陣列
+        });
+      } else {
+        throw new functions.https.HttpsError(
+            "already-exists", "Request already sent.");
+      }
+      return {success: true};
+    });
+
+/**
+ * 回應好友邀請
+ */
+exports.respondFriendRequest = functions // ✅ 移除 .region(REGION)
+    .https.onCall(async (data, context) => {
+      if (!context.auth) {
+        throw new functions.https.HttpsError(
+            "unauthenticated", "Must be authenticated.");
+      }
+      const {requesterId, accept} = data;
+      if (!requesterId || typeof accept !== "boolean") {
+        throw new functions.https.HttpsError(
+            "invalid-argument", "Missing info");
+      }
+      const myUid = context.auth.uid;
+      const userRef = db.collection("users").doc(myUid);
+      const userSnap = await userRef.get();
+      if (!userSnap.exists) {
+        throw new functions.https.HttpsError("not-found", "User not found");
+      }
+      const userData = userSnap.data();
+      const userAppId = userData.appId || userData.friendCode;
+
+      await userRef.update({
+        friendRequests: fieldValue.arrayRemove(requesterId),
+      });
+
+      const requesterRef = db.collection("users").doc(requesterId);
+      const requesterSnap = await requesterRef.get();
+      if (!requesterSnap.exists) {
+        throw new functions.https.HttpsError("not-found", "Requester not found");
+      }
+      const requesterData = requesterSnap.data();
+      if (accept) {
+        await userRef.update({
+          friends: fieldValue.arrayUnion(requesterId),
+        });
+        // ✅ 修正：安全地過濾 notifications 陣列
+        const notifications = (requesterData.notifications || []).filter(Boolean);
+        notifications.push({
+          id: generateAppId(),
+          type: "friend_accept",
+          from: userAppId,
+          fromUid: myUid,
+          timestamp: fieldValue.serverTimestamp(),
+          read: false,
+        });
+        await requesterRef.update({
+          friends: fieldValue.arrayUnion(myUid),
+          notifications: notifications,
+        });
+      }
+      return {success: true};
+    });
+
+
+/**
+ * 取得好友列表 (✅ 已重構為最安全版本)
+ */
+exports.getFriends = functions // ✅ 移除 .region(REGION)
+    .https.onCall(async (data, context) => {
+      if (!context.auth) {
+        throw new functions.https.HttpsError(
+            "unauthenticated", "Must be authenticated.");
+      }
+      const authUid = context.auth.uid;
+      const userSnap = await db.collection("users").doc(authUid).get();
+      if (!userSnap.exists) {
+        throw new functions.https.HttpsError("not-found", "User not found");
+      }
+
+      const friendsUids = userSnap.data().friends || [];
+
+      // 1. 過濾掉無效的 UID
+      const validFriendUids = friendsUids.filter((uid) => {
+        return uid && typeof uid === "string" && uid.trim() !== "";
+      });
+
+      if (validFriendUids.length === 0) {
+        return [];
+      }
+
+      // 2. 關鍵修復：改用 Promise.all 搭配個別的 get()
+      const friendPromises = validFriendUids.map((fid) => {
+        return db.collection("users").doc(fid).get().catch((error) => {
+          functions.logger.error(
+              `Failed to fetch friend with UID: ${fid}`, error);
+          return null;
+        });
+      });
+
+      const friendSnaps = await Promise.all(friendPromises);
+
+      const friendsData = [];
+      friendSnaps.forEach((friendSnap) => {
+        if (friendSnap && friendSnap.exists) {
+          const friendData = friendSnap.data();
+          if (friendData) {
+            friendsData.push({
+              id: friendSnap.id,
+              appId: friendData.appId || friendData.friendCode,
+              displayName: friendData.displayName,
+              avatarUrl: friendData.avatarUrl,
+              level: friendData.level,
+              latlng: friendData.latlng,
+              xp: friendData.xp,
+              xpToNextLevel: friendData.xpToNextLevel,
+              missionsCompleted: friendData.missionsCompleted,
+              checkIns: friendData.checkIns,
+            });
+          }
+        }
+      });
+
+      return friendsData;
+    });
+
+
+/**
+ * 取得通知列表
+ */
+exports.getNotifications = functions // ✅ 移除 .region(REGION)
+    .https.onCall(
+        async (data, context) => {
+          if (!context.auth) {
+            throw new functions.https.HttpsError(
+                "unauthenticated",
+                "Must be authenticated.",
+            );
+          }
+          const authUid = context.auth.uid;
+          const userSnap = await db.collection("users").doc(authUid).get();
+          if (!userSnap.exists) {
+            throw new functions.https.HttpsError(
+                "not-found",
+                "User not found",
+            );
+          }
+          const notifications = userSnap.data().notifications || [];
+          notifications.sort((a, b) => {
+            if (a.timestamp && b.timestamp) {
+              const timeA = a.timestamp._seconds || a.timestamp.seconds || 0;
+              const timeB = b.timestamp._seconds || b.timestamp.seconds || 0;
+              return timeB - timeA;
+            } else if (a.timestamp) {
+              return -1;
+            } else if (b.timestamp) {
+              return 1;
+            }
+            return 0;
+          });
+          return notifications;
+        },
+    );
+
+// =================================================================
+// 3. 通知 (Callable Functions)
+// =================================================================
+
+/**
+ * 前端在「完成任務」時呼叫此函數
+ * @param {object} data - {missionName: "任務名稱", xpReward: 50}
+ */
+exports.triggerMissionComplete = functions // ✅ 移除 .region(REGION)
+    .https.onCall(
+        async (data, context) => {
+          if (!context.auth) {
+            throw new functions.https.HttpsError(
+                "unauthenticated", "Must be authenticated.");
+          }
+          const {missionName, xpReward} = data;
+          if (!missionName || !xpReward) {
+            throw new functions.https.HttpsError(
+                "invalid-argument", "Missing mission info.");
+          }
+
+          const userRef = db.collection("users").doc(context.auth.uid);
+          const notification = {
+            id: generateAppId(),
+            type: "mission_complete",
+            message: `任務完成：${missionName}！您獲得了 ${xpReward} 經驗值。`,
+            timestamp: fieldValue.serverTimestamp(),
+            read: false,
+          };
+
+          await userRef.update({
+            notifications: fieldValue.arrayUnion(notification),
+            missionsCompleted: fieldValue.increment(1),
+            xp: fieldValue.increment(xpReward),
+          });
+
+          return {success: true};
+        },
+    );
+
+/**
+ * 前端在「等級升級」時呼叫此函數
+ * @param {object} data - {newLevel: 3}
+ */
+exports.triggerLevelUp = functions // ✅ 移除 .region(REGION)
+    .https.onCall(async (data, context) => {
+      if (!context.auth) {
+        throw new functions.https.HttpsError(
+            "unauthenticated", "Must be authenticated.");
+      }
+      const {newLevel} = data;
+      if (!newLevel) {
+        throw new functions.https.HttpsError(
+            "invalid-argument", "Missing newLevel.");
+      }
+
+      const userRef = db.collection("users").doc(context.auth.uid);
+      const notification = {
+        id: generateAppId(),
+        type: "level_up",
+        message: `恭喜！您已升級至 ${newLevel} 等！`,
+        timestamp: fieldValue.serverTimestamp(),
+        read: false,
+      };
+
+      await userRef.update({
+        notifications: fieldValue.arrayUnion(notification),
+      });
+
+      return {success: true};
+    });
+
+/**
+ * 前端在「收到優惠卷」時呼叫此函數
+ * @param {object} data - {couponName: "啤酒買一送一"}
+ */
+exports.triggerCouponNotification = functions // ✅ 移除 .region(REGION)
+    .https.onCall(
+        async (data, context) => {
+          if (!context.auth) {
+            throw new functions.https.HttpsError(
+                "unauthenticated", "Must be authenticated.");
+          }
+          const {couponName} = data;
+          if (!couponName) {
+            throw new functions.https.HttpsError(
+                "invalid-argument", "Missing couponName.");
+          }
+
+          const userRef = db.collection("users").doc(context.auth.uid);
+          const notification = {
+            id: generateAppId(),
+            type: "new_coupon",
+            message: `您已獲得一張新的優惠卷：${couponName}！`,
+            linkTo: "/coupons",
+            timestamp: fieldValue.serverTimestamp(),
+            read: false,
+          };
+
+          await userRef.update({
+            notifications: fieldValue.arrayUnion(notification),
+          });
+
+          return {success: true};
+        },
+    );
+
+// =================================================================
+// 4. 動態牆 (Feed)
+// =================================================================
+
+/**
+ * 取得好友和自己的貼文 (動態牆)
+ * @param {object} data - (空)
+ * @param {functions.https.CallableContext} context - 函式上下文
+ * @return {Promise<Array<object>>} 貼文列表
+ * ⚠️ 需要複合索引: posts, authorId asc, createdAt desc
+ */
+exports.getFeed = functions // ✅ 移除 .region(REGION)
+    .https.onCall(async (data, context) => {
+      if (!context.auth) {
+        throw new functions.https.HttpsError(
+            "unauthenticated", "Must be authenticated.");
+      }
+
+      const myUid = context.auth.uid;
+
+      // 1. 取得自己的 Profile，獲取好友列表
+      const userSnap = await db.collection("users").doc(myUid).get();
+      if (!userSnap.exists) {
+        throw new functions.https.HttpsError("not-found", "User not found");
+      }
+
+      const friends = userSnap.data().friends || [];
+
+      // 2. 過濾掉無效的 UID，防止 'in' 查詢崩潰
+      const validFriendUids = friends.filter((uid) => {
+        return uid && typeof uid === "string" && uid.trim() !== "";
+      });
+
+      // 3. 建立要查詢的 ID 列表 (包含自己和「有效的好友」)
+      const feedUids = [myUid, ...validFriendUids];
+
+      // 4. Firestore 'in' 查詢限制 (最多 30 個)
+      if (feedUids.length > 30) {
+        feedUids.splice(30);
+      }
+
+      if (feedUids.length === 0) {
+        return [];
+      }
+
+      try {
+        // 5. 查詢 'posts' 集合
+        // ⚠️ 這是複合查詢，如果失敗，請檢查索引。
+        const postsSnap = await db
+            .collection("posts")
+            .where("authorId", "in", feedUids)
+            .orderBy("createdAt", "desc")
+            .limit(30)
+            .get();
+
+        const feedItems = [];
+        postsSnap.forEach((doc) => {
+          feedItems.push({
+            id: doc.id,
+            ...doc.data(),
+          });
+        });
+
+        return feedItems;
+      } catch (error) {
+        // 捕捉錯誤，回報給前端一個更具體的錯誤
+        console.error(
+            "getFeed failed (LIKELY INDEX ISSUE):", error.message);
+        throw new functions.https.HttpsError(
+            "internal",
+            "Feed query failed (Index missing or building).",
+        );
+      }
+    });
+
+
+// =================================================================
+// 5. 更新使用者位置
+// =================================================================
+
+/**
+ * 前端在「取得 GPS」時呼叫此函數
+ * @param {object} data - {latlng: {lat: 25.04, lng: 121.53}}
+ */
+exports.updateUserLocation = functions // ✅ 移除 .region(REGION)
+    .https.onCall(
+        async (data, context) => {
+          if (!context.auth) {
+            throw new functions.https.HttpsError(
+                "unauthenticated", "Must be authenticated.");
+          }
+          const {latlng} = data;
+          // ✅ 修正：將 latLng 改為 latlng
+          if (!latlng || typeof latlng.lat !== "number" ||
+            typeof latlng.lng !== "number") {
+            throw new functions.https.HttpsError(
+                "invalid-argument", "Invalid latlng object.");
+          }
+
+          const userRef = db.collection("users").doc(context.auth.uid);
+
+          await userRef.update({
+            latlng: latlng, // 更新 latlng 欄位
+            updatedAt: fieldValue.serverTimestamp(), // 同時更新「最後上線時間」
+          });
+
+          return {success: true};
+        },
+    );
+
+// =================================================================
+// 6. 聊天通知 (Firestore 觸發器)
+// =================================================================
+
+/**
+ * 監聽 /chats/{chatId}/messages/{messageId} 的新文件
+ * 並發送通知給聊天室的「另一位」用戶
+ */
+exports.sendChatNotification = functions // ✅ 移除 .region(REGION)
+    .firestore
+    .document("chats/{chatId}/messages/{messageId}")
+    .onCreate(async (snapshot, context) => {
+      const messageData = snapshot.data();
+      const chatId = context.params.chatId;
+      const senderId = messageData.senderId;
+
+      if (!messageData || !chatId || !senderId) {
+        functions.logger.error("Chat notification missing data.",
+            {chatId, senderId});
+        return null;
+      }
+
+      // 1. 取得聊天室的 metadata，找出「接收者」
+      const chatDoc = await db.collection("chats").doc(chatId).get();
+      if (!chatDoc.exists) {
+        functions.logger.error(`Chat document ${chatId} not found.`);
+        return null;
+      }
+
+      const participants = chatDoc.data().participants || [];
+      const recipientId = participants.find((uid) => uid !== senderId);
+
+      if (!recipientId) {
+        functions.logger.warn(
+            `Could not find recipient in chat ${chatId}.`,
+            {participants, senderId});
+        return null;
+      }
+
+      // 2. 取得「發送者」的 Profile (為了顯示名字)
+      const senderSnap = await db.collection("users").doc(senderId).get();
+      if (!senderSnap.exists) {
+        functions.logger.error(`Sender profile ${senderId} not found.`);
+        return null;
+      }
+      const senderName = senderSnap.data().displayName || "有人";
+
+      // 3. 準備通知物件
+      const notification = {
+        id: generateAppId(), // 產生隨機 ID
+        type: "chat_message",
+        message: `${senderName} 傳送了一則新訊息給您。`,
+        from: senderName,
+        fromUid: senderId,
+        linkTo: `/chat/${chatId}`, // 讓 App 可以點擊跳轉
+        timestamp: fieldValue.serverTimestamp(),
+        read: false,
+      };
+
+      // 4. 將通知寫入「接收者」的 notifications 陣列
+      const recipientRef = db.collection("users").doc(recipientId);
+      try {
+        await recipientRef.update({
+          notifications: fieldValue.arrayUnion(notification),
+        });
+        functions.logger.log(
+            `Chat notification sent to ${recipientId} from ${senderId}`);
+      } catch (error) {
+        functions.logger.error(
+            `Failed to send chat notification to ${recipientId}`, error);
+      }
+      return null;
+    });
+
+// =================================================================
+// 7. ✅ 【新功能】動態牆留言 (Callable + 觸發器)
+// =================================================================
+
+/**
+ * 前端在「送出留言」時呼叫此函數
+ * @param {object} data - {postId: "...", commentText: "..."}
+ */
+exports.addCommentToPost = functions // ✅ 移除 .region(REGION)
+    .https.onCall(async (data, context) => {
+      if (!context.auth) {
+        throw new functions.https.HttpsError(
+            "unauthenticated", "Must be authenticated.");
+      }
+      const {postId, commentText} = data;
+      const commenterUid = context.auth.uid;
+
+      if (!postId || !commentText || !commenterUid) {
+        throw new functions.https.HttpsError(
+            "invalid-argument", "Missing data.");
+      }
+
+      // 1. 取得留言者的 Profile
+      const userSnap = await db.collection("users").doc(commenterUid).get();
+      if (!userSnap.exists) {
+        throw new functions.https.HttpsError(
+            "not-found", "Commenter profile not found.");
+      }
+      const userData = userSnap.data();
+
+      // 2. 建立留言物件
+      const newComment = {
+        authorId: commenterUid,
+        authorDisplayName: userData.displayName,
+        authorAvatarUrl: userData.avatarUrl,
+        text: commentText,
+        timestamp: fieldValue.serverTimestamp(),
+      };
+
+      // 3. 將留言寫入 'posts' 集合下的 'comments' 子集合
+      await db
+          .collection("posts")
+          .doc(postId)
+          .collection("comments")
+          .add(newComment);
+
+      return {success: true, comment: newComment};
+    });
+
+/**
+ * 【自動觸發】監聽 /posts/{postId}/comments/{commentId} 的新文件
+ * 並發送通知給「貼文作者」
+ */
+exports.sendCommentNotification = functions // ✅ 移除 .region(REGION)
+    .firestore
+    .document("posts/{postId}/comments/{commentId}")
+    .onCreate(async (snapshot, context) => {
+      const commentData = snapshot.data();
+      const postId = context.params.postId;
+      const commenterId = commentData.authorId; // 留言者 ID
+
+      // 1. 取得貼文，找出「貼文作者」
+      const postDoc = await db.collection("posts").doc(postId).get();
+      if (!postDoc.exists) {
+        functions.logger.error(`Post ${postId} not found.`);
+        return null;
+      }
+      const postAuthorId = postDoc.data().authorId; // 貼文作者 ID
+
+      // 2. 如果作者幫自己留言，不要發通知
+      if (postAuthorId === commenterId) {
+        functions.logger.log(
+            "User commented on their own post. No notification.");
+        return null;
+      }
+
+      // 3. 準備通知物件 (留言者的名字已在 commentData 中)
+      const commenterName = commentData.authorDisplayName || "有人";
+      const notification = {
+        id: generateAppId(),
+        type: "new_comment",
+        message: `${commenterName} 在您的貼文上留言。`,
+        from: commenterName,
+        fromUid: commenterId,
+        linkTo: `/post/${postId}`, // (假設您有單一貼文頁面)
+        timestamp: fieldValue.serverTimestamp(),
+        read: false,
+      };
+
+      // 4. 將通知寫入「貼文作者」的 notifications 陣列
+      const recipientRef = db.collection("users").doc(postAuthorId);
+      try {
+        await recipientRef.update({
+          notifications: fieldValue.arrayUnion(notification),
+        });
+        functions.logger.log(
+            `Comment notification sent to ${postAuthorId} from ${commenterId}`);
+      } catch (error) {
+        functions.logger.error(
+            `Failed to send comment notification to ${postAuthorId}`, error);
+      }
+      return null;
+    });
